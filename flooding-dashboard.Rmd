@@ -1,0 +1,209 @@
+---
+title: "Monitoring stream gauge water levels: Floyd Bennett Field (NY)"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+---
+```{r, setup , echo = FALSE}
+#STEP 0: SET UP
+
+#Load libraries
+  pacman::p_load(flexdashboard, DT, plotly, ggplot2, forecast, lubridate)
+
+#Set target date
+  #For demo purposes, we manually set the end date of the API request.
+  #Alternatively, to retrieve today's data, comment out lines 13 and 14
+  #And uncomment line 16
+    end_date <- "2012-10-29" 
+    end_date <- as.Date(end_date, "%Y-%m-%d") 
+    #end_date <- Sys.Date() 
+    
+  #Number of days in window up to 120 days
+    days <- 14
+    start_date <- end_date - days
+
+#Set name of main parameter
+  param_name <- "Water Level (feet)"
+  
+#Set frequency which is 10 times an hour for 24 hours
+  seasonal_frequency <- 10 * 24 
+  
+#Set level for alerts (in feet)
+  alert_level <- 7
+
+```
+
+```{r, dataingest, include=FALSE}
+#STEP 1: INGEST DATA
+#Make sure data frame is called "data" and main variable of interest is "value"
+
+#Construct URL to extract from USGS website
+  url <- "https://nwis.waterdata.usgs.gov/ny/nwis/uv?cb_62620=on&cb_62620=on&format=rdb&site_no=01311875&period=&begin_date=yyyy&end_date=xxxx"
+  url <- gsub("xxxx", end_date, url)
+  url <- gsub("yyyy", start_date, url)
+
+#Download API request -- note that the top of the file has a long header
+  temp <- tempfile()
+  download.file(url, temp)
+  out <- readLines(temp, n = 50)
+
+#Find the line in which the header begins
+  index1 <- which(substr(out, 1, 4) == "agen")[1]
+  index2 <- which(substr(out, 1, 2) == "5s")[1]
+  header <- unlist(strsplit(out[index1], "\t"))
+
+#Read in file as tab delimited from where file begins
+  data <- read.delim(temp, sep = "\t", skip = index2 - 1)
+  
+#Assign header names
+  colnames(data) <- header
+  colnames(data)[5] <- "value"
+  
+#The file changes format over the last decade. 
+#Also missing values are more prevalent in some periods
+#The code below fills in missing values.
+  if(length(colnames(data)) > 6){
+    #Find missing values
+      miss_values <- is.na(data[,5])
+    
+    #Use tidal predictions (a more recent, more complete data field) 
+    #to fill in the elevation estimate. Use linear regression to trend values
+      mod <- lm(value ~ `238986_62620`, data = data)
+      yhat <- predict(mod, data)
+      data[miss_values, 5] <- yhat[miss_values]
+      
+    #Retain first five columns to keep data format the same as historical
+      data <- data[, 1:5]
+  }
+
+#Clean up time
+  data$time <- ymd_hm(data$datetime)
+```
+
+```{r, timeseries, echo = F}
+#STEP 2A: TIME SERIES ANALYSIS
+  
+  #Find outliers in data
+    temp <- ts(data$value, frequency = seasonal_frequency)
+    
+  #Calculate STL
+    temp_stl <- stl(temp, s.window = "periodic")
+  
+  #Calculate upper and lower bounds of each series
+    x1 <- temp_stl$time.series
+    data$lower.bound <-   x1[,1] + x1[,2] - 3*sd(x1[,3])
+    data$upper.bound <-  x1[,1] + x1[,2] + 3*sd(x1[,3])
+  
+```
+
+```{r, envstats, echo = F}
+#STEP 2B: CALCULATE ENVIRONMENTAL STATISTICS
+#Get time indexes
+  last_hour_index <- (nrow(data) - 9):nrow(data)
+  last_12hour_index <- (nrow(data) - 10*12+1):nrow(data)
+  last_24hour_index <- (nrow(data) - 10*24+1):nrow(data)
+  last_48hour_index <- (nrow(data) - (10*48)+1):nrow(data)
+  
+#Relative to now, how long has the upper bound been over the limit
+  upper_alert <- data.frame(
+                      field = "Upper > Alert (%)",
+                      last.hour = round(100*mean(data$upper.bound[last_hour_index] > alert_level)),
+                      last.12hours = round(100*mean(data$upper.bound[last_12hour_index] > alert_level)), 
+                      last.24hours = round(100*mean(data$upper.bound[last_24hour_index] > alert_level)))
+ 
+#Relative to now, how long has the upper bound been over the limit
+  actual_alert <- data.frame(
+                      field = "Actual > Alert (%)",
+                      last.hour = round(100*mean(data$value[last_hour_index] > alert_level)),
+                      last.12hours = round(100*mean(data$value[last_12hour_index] > alert_level)), 
+                      last.24hours = round(100*mean(data$value[last_24hour_index] > alert_level)))
+ 
+#If 24 hour trend continues, forecast using an STL decomposition 
+  #Estimate a STL model then forecast (using forecast package)
+    #s.window = dictates the seasonality window
+    #t.window = a 3 day window
+    fit <- stlf(temp, s.window = 3, t.window = 24*10*3)
+    fcst <- forecast(fit, h = 24*10)
+
+  #Calculate statistics
+    forecast_alert <- data.frame(
+                      field = "Forecast > Alert (%)",
+                      last.hour = round(100*mean(fcst$mean[231:240] > alert_level)),
+                      last.12hours = round(100*mean(fcst$mean[121:240] > alert_level)),
+                      last.24hours = round(100*mean(fcst$mean > alert_level)))
+ 
+#Combine
+  alert_summary <- rbind(upper_alert, actual_alert, forecast_alert)
+  
+#Render data tables
+  colnames(alert_summary) <- c("Field", "Hour", "12 Hours", "24 Hours")
+```
+
+
+```{r, commentarylogic, echo = FALSE, warning=FALSE, message=FALSE}
+#STEP 2C: COMMENTARY BRANCHING LOGIC
+
+#Write branching logic for different responses
+  if(upper_alert$last.hour[1] > 0 && upper_alert$last.24hours[1] > 0 && forecast_alert$last.24hours[1] ==0){
+    alert_msg <- "WARNING: Water levels may rise. Upper bound of stream gauge water levels exceed threshold level; However, current short-range forecasts indicate no significant increase."
+    } else if(actual_alert$last.hour[1] > 0){
+       alert_msg <- "ALERT: Water levels are currently above the alert level. Seek shelter and higher ground. Await further instruction from emergency services."
+    } else if(forecast_alert$last.hour[1] > 0||forecast_alert$last.12hours[1] > 0 ){
+      alert_msg <- "ALERT: Water levels will likely rise. There is a chance of water reaching the alert level in the next hour and a YYY% chance in the next 12-hours. Stand-down operations and alert personnel in area to move vehicles and other valuable equipment to higher ground and seek shelter. Consult with local emergency services. "
+      alert_msg <- gsub("XXX", forecast_alert$last.hour[1], alert_msg)
+      alert_msg <- gsub("YYY", forecast_alert$last.12hours[1], alert_msg)
+      
+    } else {
+        alert_msg <- "Water levels are normal."
+  }
+```
+
+Row
+-----------------------------------------------------------------------
+
+### Water level
+
+```{r}
+#STEP 3A: RENDER TIME SERIES PLOT
+
+#Highlight today
+  today_flag <- format(data$time, "%Y-%m-%d")
+  data$today <- NA
+  data$today[which(today_flag == end_date)] <- data$value[which(today_flag == end_date)]
+
+#Set up plot using ggplot2
+  p <- ggplot(data) + 
+      geom_line(aes(y = value, x = time), 
+                colour = "lightblue") +
+      geom_ribbon(aes(ymin = lower.bound, ymax = upper.bound, x = time), 
+                  alpha = 0.3) +
+      geom_hline(yintercept = alert_level, colour = "red", 
+                 linetype = "dashed") + 
+      geom_line(aes(y = today,  x = time), 
+                 colour = "blue") + 
+      ylab(param_name) + xlab("Time") + 
+      theme_minimal()
+  
+#Render as an interactive in plotly
+  p <- ggplotly()
+  p
+
+```
+
+Row
+-----------------------------------------------------------------------
+
+
+### Environmental Summary
+
+Percent of time windows that will likely experience a flooding event.
+```{r}
+#STEP 3B: RENDER DATATABLE
+  datatable(alert_summary, rownames = FALSE, options = list(dom = 't'))
+```
+
+### Commentary
+
+`r #STEP 3C: RENDER COMMENTARY`
+`r paste0(end_date, " - ", alert_msg)` 
+
